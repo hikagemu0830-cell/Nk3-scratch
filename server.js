@@ -1,32 +1,26 @@
-// server.js — Render等で動くNode.js版 中継(リバース)プロキシ（YouTube / nocookie オーバーレイ版）
+// server.js — Render等で動くNode.js版 中継(リバース)プロキシ
 // 要件: Node.js 20+ / package.json に "type": "module"
 //
 // 構成（通信を丸ごとProxy経由にする3層）
 //  1) サーバー側 : HTML/CSSのURLを全部書き換え（外部サイトは /~p/<scheme>/<host>/<path> 経由）
-//  2) ブラウザ側 : /~shim.js が fetch/XHR/動的要素/cookie/メディア などをProxy化
+//  2) ブラウザ側 : /~shim.js が fetch/XHR/WebSocket/動的要素/cookie などをProxy化
 //  3) ServiceWorker: /~sw.js がページから出る全リクエストを最終的にProxyへ回収
+// 従来どおり、TARGET のサイトは「ルート直下」でそのまま中継されます（互換維持）。
 //
-// YouTube の動作
-//  - youtube.com のページ（/watch 等）は本家の画面をそのまま表示する
-//  - 本家プレーヤーの再生は停止する（メディアの src / play / load / MediaSource、
-//    googlevideo への取得をブラウザ側で遮断）
-//  - 本家プレーヤーの位置に、www.youtube-nocookie.com/embed/ID の iframe を重ねて表示する
-//    （位置・サイズは毎フレーム追従。SPA遷移でも動画IDに合わせて差し替え）
-//  - /embed/ID, /v/ID, youtu.be/ID は nocookie の埋め込みに振り替える（HTML/JS/サーバー全て）
-//  - nocookie 宛には Cookie を送らず、nocookie からの Set-Cookie も保存しない
-//  - FRAME_LOCK=1（既定）のとき、HTMLに frame-src 'self' を付与し、直接の外部フレームを遮断
+// 追加: ホスト名に "nocookie" を含むもの（youtube-nocookie.com 等）はProxyを通さず直接表示
 //
-// 注意: Render の環境変数 TARGET が別の値のままだと、そちらが優先されます。
-//       TARGET=https://www.youtube.com/ に変更してください。
+// 修正点（ルート直下パスの誤転送）
+//  - ページ遷移(navigation/iframe)は Referer を一切見ず、必ず TARGET へ転送する
+//  - Referer を見るのは「サブリソース（画像・JS等）」かつ「Refererが外部サイトのProxyページ」の場合だけ
+//    → 別サイト(GitHub等)のページからTARGETのリンクを踏んでも、GitHubへ飛ばなくなる
 //
 // 環境変数
-//  TARGET            中継の主対象（既定 https://www.youtube.com/）
+//  TARGET            中継の主対象（既定 https://lovable.dev/）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
 //  HEADER_TIMEOUT_MS 上流のヘッダ待ち上限（既定 25000）
 //  BODY_TIMEOUT_MS   HTML/CSS本文の受信上限（既定 60000）
-//  FRAME_LOCK        0 にするとフレーム制限(frame-src 'self')を付けない（既定は有効）
 
 import http from "node:http";
 import net from "node:net";
@@ -35,10 +29,9 @@ import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import { Readable, pipeline } from "node:stream";
 
-const TARGET = process.env.TARGET || "https://www.youtube.com/";
+const TARGET = process.env.TARGET || "https://lovable.dev/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
-const FRAME_LOCK = process.env.FRAME_LOCK !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
 const HEADER_TIMEOUT = Number(process.env.HEADER_TIMEOUT_MS) || 25000;
 const BODY_TIMEOUT = Number(process.env.BODY_TIMEOUT_MS) || 60000;
@@ -55,63 +48,9 @@ const P = "/~p/"; // 外部サイト用: /~p/https/host/path
 const WS = "/~ws/"; // WebSocket用: /~ws/wss/host/path
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ───────────────────────── YouTube / nocookie 定義 ─────────────────────────
-const NOCOOKIE_HOST = "www.youtube-nocookie.com";
-const YT_HOSTS = ["youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"];
-const NC_RE = /(^|\.)youtube-nocookie\.com$/i;
-const FRAME_CSP = "frame-src 'self' blob: data:";
-
-function isNoCookieHost(h) {
-  return NC_RE.test(String(h));
-}
-
-// URLを nocookie の埋め込みに振り替える（破壊的に書き換えて同じオブジェクトを返す）
-function toNoCookie(u) {
-  const h = u.hostname.toLowerCase();
-  if (isNoCookieHost(h)) {
-    if (h !== NOCOOKIE_HOST) u.hostname = NOCOOKIE_HOST;
-  } else if (YT_HOSTS.includes(h) && /^\/(embed|v)\//.test(u.pathname)) {
-    u.hostname = NOCOOKIE_HOST;
-  } else if (h === "youtu.be") {
-    const id = u.pathname.slice(1).split("/")[0];
-    if (id) {
-      u.hostname = NOCOOKIE_HOST;
-      u.pathname = "/embed/" + id;
-    }
-  }
-  return u;
-}
-
-// watch系のURLなら nocookie の埋め込みURLを返す（該当しなければ null）
-function embedFromWatch(u) {
-  const h = u.hostname.toLowerCase();
-  if (!YT_HOSTS.includes(h)) return null;
-  let id = null;
-  let list = null;
-  if (u.pathname === "/watch") {
-    id = u.searchParams.get("v");
-    list = u.searchParams.get("list");
-  } else if (u.pathname === "/playlist") {
-    list = u.searchParams.get("list");
-  } else {
-    const m = /^\/(shorts|live)\/([\w-]+)/.exec(u.pathname);
-    if (m) id = m[2];
-  }
-  let e;
-  if (id && /^[\w-]{6,}$/.test(id)) {
-    e = new URL("https://" + NOCOOKIE_HOST + "/embed/" + id);
-    if (list) e.searchParams.set("list", list);
-  } else if (list) {
-    e = new URL("https://" + NOCOOKIE_HOST + "/embed/videoseries");
-    e.searchParams.set("list", list);
-  } else {
-    return null;
-  }
-  const t = u.searchParams.get("t");
-  const s = t && /^(\d+)s?$/.exec(t);
-  if (s) e.searchParams.set("start", s[1]);
-  return e;
-}
+// ★追加: Proxyを通さず直接表示するホスト（nocookie を含むもの）
+const DIRECT_RE = /nocookie/i;
+const isDirectHost = (h) => DIRECT_RE.test(String(h));
 
 // ───────────────────────── Cookie名の名前空間（サーバー/ブラウザ共通） ─────────────────────────
 // 1つのProxyドメインに複数サイトのcookieが混ざらないよう、サイトごとに接頭辞を付ける
@@ -128,7 +67,7 @@ function toProxy(href, myOrigin) {
   let u;
   try { u = new URL(href); } catch { return href; }
   if (u.protocol !== "http:" && u.protocol !== "https:") return href;
-  toNoCookie(u);
+  if (isDirectHost(u.hostname)) return u.href; // ★直接表示
   if (isSiteHost(u.hostname)) return myOrigin + u.pathname + u.search + u.hash;
   return myOrigin + P + u.protocol.slice(0, -1) + "/" + u.host + u.pathname + u.search + u.hash;
 }
@@ -163,21 +102,22 @@ function isNavigation(req) {
   return /text\/html/i.test(req.headers.accept || "");
 }
 
-// このリクエストが最終的に取りに行く上流URLを決める（nocookie 振り替え済み）
+// このリクエストが最終的に取りに行く上流URLを決める
 function resolveUpstream(req, url, myOrigin) {
-  // 1) /~p/https/host/path は明示的な外部サイト指定
+  // 1) /~p/https/host/path は明示的な外部サイト指定 → そのまま
   const p = parseProxyPath(url.pathname);
-  if (p) return toNoCookie(new URL(p.origin + p.path + url.search));
+  if (p) return new URL(p.origin + p.path + url.search);
 
-  // 2) ルート直下のパス（/watch 等）
+  // 2) ルート直下のパス（/projects/ 等）
   //    ページ遷移は Referer を見ない → 必ず TARGET へ
+  //    （別サイトのページ上のリンクは、ここで TARGET に戻る）
   let origin = BASE.origin;
   if (!isNavigation(req) && req.headers.referer) {
     // サブリソースのみ: Refererが「外部サイトのProxyページ」ならそのサイトへ
     const real = realFromProxyUrl(req.headers.referer, myOrigin);
     if (real && !isSiteHost(real.hostname)) origin = real.origin;
   }
-  return toNoCookie(new URL(origin + url.pathname + url.search));
+  return new URL(origin + url.pathname + url.search);
 }
 
 // ───────────────────────── SSRF対策（社内/ローカル宛を拒否） ─────────────────────────
@@ -333,8 +273,6 @@ function rewriteSetCookie(line, host, secureProxy) {
   return out.join("; ");
 }
 function cookieFor(req, hostname) {
-  // nocookie 宛には一切 Cookie を送らない
-  if (isNoCookieHost(hostname)) return "";
   const ck = CK(hostname);
   return (req.headers.cookie || "")
     .split(/;\s*/)
@@ -381,7 +319,7 @@ function corsHeaders(req) {
   };
 }
 
-// ★修正2: PJAX/Turbo等が返す特殊ヘッダやLocationをプロキシ用に書き換える
+// ★修正2: GitHub等（PJAX/Turbo）が返す特殊ヘッダやLocationをプロキシ用に書き換える
 function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
   for (const [k, v] of r.headers) {
@@ -399,11 +337,8 @@ function responseHeaders(r, req, upstream, myOrigin) {
     h[k] = v;
   }
   Object.assign(h, corsHeaders(req));
-  // nocookie からの Set-Cookie は保存しない
   const sc = typeof r.headers.getSetCookie === "function" ? r.headers.getSetCookie() : [];
-  const cookies = isNoCookieHost(upstream.hostname)
-    ? []
-    : sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
+  const cookies = sc.map((c) => rewriteSetCookie(c, upstream.hostname, myOrigin.startsWith("https"))).filter(Boolean);
   if (cookies.length) h["set-cookie"] = cookies;
   return h;
 }
@@ -500,6 +435,13 @@ async function handle(req, res) {
   }
 
   const upstream = resolveUpstream(req, url, myOrigin);
+
+  // ★追加: /~p/ 経由で nocookie に来てしまった場合は直接URLへリダイレクト
+  if (isDirectHost(upstream.hostname) && req.method === "GET" && parseProxyPath(url.pathname)) {
+    res.writeHead(302, { location: upstream.href, "cache-control": "no-store" });
+    return res.end();
+  }
+
   if (upstream.hostname.toLowerCase() === host.replace(/:\d+$/, "").toLowerCase() && !isSiteHost(upstream.hostname))
     throw httpErr(508, "Loop detected");
   await assertPublic(upstream.hostname);
@@ -555,8 +497,6 @@ async function handle(req, res) {
       hdrs["cache-control"] = "no-store";
       delete hdrs.etag;
       delete hdrs["last-modified"];
-      // 直接の外部フレーム（youtube.com 等）を遮断し、必ずProxy経由にさせる
-      if (FRAME_LOCK) hdrs["content-security-policy"] = FRAME_CSP;
     }
     res.writeHead(status, hdrs);
     return res.end(out);
@@ -564,7 +504,6 @@ async function handle(req, res) {
 
   // それ以外（画像・動画・JS・JSON等）はストリーム転送（Range/206もそのまま）
   if (lenH && !enc) hdrs["content-length"] = lenH;
-  if (isHtml && FRAME_LOCK) hdrs["content-security-policy"] = FRAME_CSP;
   res.writeHead(status, hdrs);
   pipeline(Readable.fromWeb(r.body), res, () => {});
 }
@@ -617,11 +556,8 @@ function makeShim() {
 "use strict";
 if(window.__pxShim)return;window.__pxShim=1;
 var O=location.origin,P=${JSON.stringify(P)},WSP=${JSON.stringify(WS)},T=${JSON.stringify(BASE.origin)},HOSTS=${JSON.stringify(SITE_HOSTS)};
-var NOCOOKIE_HOST=${JSON.stringify(NOCOOKIE_HOST)},YT_HOSTS=${JSON.stringify(YT_HOSTS)},NC_RE=${NC_RE.toString()};
+var DIRECT=${DIRECT_RE.toString()};
 var ckey=${ckey.toString()};
-${isNoCookieHost.toString()}
-${toNoCookie.toString()}
-${embedFromWatch.toString()}
 function isSite(h){return HOSTS.indexOf(String(h).toLowerCase())>=0}
 function parseP(pn){
   if(pn.indexOf(P)!==0)return null;
@@ -632,13 +568,6 @@ function realBase(){
   try{var p=parseP(location.pathname);return p?new URL(p.origin+p.path+location.search):new URL(T+location.pathname+location.search)}
   catch(e){return new URL(T)}
 }
-// このページが youtube.com 本体か / nocookie の埋め込みか
-var YT_PAGE=YT_HOSTS.indexOf(realBase().hostname.toLowerCase())>=0;
-var NC_PAGE=isNoCookieHost(realBase().hostname);
-// YouTube本体のメディア取得を遮断する対象か
-function mediaBlocked(u){return YT_PAGE&&/videoplayback|googlevideo\.com/.test(String(u))}
-function mediaSrcBlocked(tag,attr){return YT_PAGE&&attr==="src"&&(tag==="video"||tag==="audio"||tag==="source"||tag==="track")}
-
 var SKIP=/^(#|javascript:|mailto:|tel:|data:|blob:|about:|sms:|ws:|wss:)/i;
 // どんなURLでもProxy経由のURLへ（何度通しても結果は同じ）
 function prox(h){
@@ -650,11 +579,16 @@ function prox(h){
     var u=new URL(t,location.href);
     if(u.protocol!=="http:"&&u.protocol!=="https:")return h;
     if(u.origin===O){
-      if(u.pathname.indexOf(P)===0||u.pathname.indexOf("/~")===0)return u.href;
+      if(u.pathname.indexOf(P)===0){
+        var pp=parseP(u.pathname);
+        if(pp){var ro=new URL(pp.origin+pp.path+u.search+u.hash);if(DIRECT.test(ro.hostname))return ro.href}
+        return u.href;
+      }
+      if(u.pathname.indexOf("/~")===0)return u.href;
       var rb=realBase();
       u=new URL(rb.origin+u.pathname+u.search+u.hash);
     }
-    u=toNoCookie(u);
+    if(DIRECT.test(u.hostname))return u.href;
     if(isSite(u.hostname))return O+u.pathname+u.search+u.hash;
     return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search+u.hash;
   }catch(e){return h}
@@ -666,6 +600,9 @@ function wsu(u){
     if(x.protocol==="ws:"||x.protocol==="wss:")sec=x.protocol==="wss:";
     else if(x.protocol==="http:"||x.protocol==="https:")sec=x.protocol==="https:";
     else return u;
+    if(x.host!==location.host&&DIRECT.test(x.hostname)){
+      return (x.protocol==="http:"||x.protocol==="https:")?(sec?"wss://":"ws://")+x.host+x.pathname+x.search:x.href;
+    }
     if(x.host===location.host){
       if(x.pathname.indexOf(WSP)===0)return scheme+location.host+x.pathname+x.search;
       return scheme+location.host+WSP+(rb.protocol==="https:"?"wss":"ws")+"/"+rb.host+x.pathname+x.search;
@@ -675,19 +612,16 @@ function wsu(u){
 }
 var sa=Element.prototype.setAttribute;
 
-// ── Cookie（サイトごとの名前空間に分離 / nocookie のページでは一切保存しない）
+// ── Cookie（サイトごとの名前空間に分離）
 function ck(){return "__px_"+ckey(realBase().hostname)+"__"}
-function ncPage(){return NC_PAGE}
 try{
   var cd=Object.getOwnPropertyDescriptor(Document.prototype,"cookie");
   Object.defineProperty(Document.prototype,"cookie",{configurable:true,enumerable:cd.enumerable,
     get:function(){
-      if(ncPage())return "";
       var p=ck();
       return cd.get.call(this).split(/;\s*/).filter(function(c){return c.indexOf(p)===0}).map(function(c){return c.slice(p.length)}).join("; ");
     },
     set:function(v){
-      if(ncPage())return;
       var parts=String(v).split(";"),nv=parts.shift().trim();
       var rest=parts.map(function(a){return a.trim()}).filter(function(a){var k=a.split("=")[0].toLowerCase();return a&&k!=="domain"&&k!=="path"&&k!=="samesite"&&k!=="partitioned"});
       cd.set.call(this,[ck()+nv].concat(rest).concat(["path=/"]).join("; "));
@@ -698,10 +632,8 @@ try{
 try{if(window.fetch){var f0=window.fetch;window.fetch=function(i,o){
   var n=i;
   try{if(typeof Request!=="undefined"&&i instanceof Request)n=new Request(prox(i.url),i);else n=prox(i)}catch(e){n=i}
-  if(mediaBlocked(typeof i==="string"?i:(i&&i.url)||""))return Promise.reject(new TypeError("blocked"));
   return f0.call(this,n,o)}}}catch(e){}
-try{var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);this.__pxBlk=mediaBlocked(u);a[1]=prox(u);return xo.apply(this,a)}}catch(e){}
-try{var xs=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.send=function(){if(this.__pxBlk)return;return xs.apply(this,arguments)}}catch(e){}
+try{var xo=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){var a=[].slice.call(arguments);a[1]=prox(u);return xo.apply(this,a)}}catch(e){}
 try{if(navigator.sendBeacon){var sb=navigator.sendBeacon;navigator.sendBeacon=function(u,d){return sb.call(navigator,prox(u),d)}}}catch(e){}
 function wrapCtor(name,fn){
   try{var C=window[name];if(!C)return;
@@ -722,61 +654,10 @@ Element.prototype.setAttribute=function(n,v){
   try{
     var l=String(n).toLowerCase(),t=this.tagName?this.tagName.toLowerCase():"";
     if(l==="integrity")return;
-    if(mediaSrcBlocked(t,l))return;
     if(l==="src"||l==="href"||l==="action"||l==="poster"||l==="formaction"||(l==="data"&&t==="object"))v=prox(v);
   }catch(e){}
   return sa.call(this,n,v);
 };
-
-// ── YouTube本体の再生を停止（メディアの src / srcObject / play / load を無効化）
-if(YT_PAGE){
-  try{
-    var MP=HTMLMediaElement.prototype;
-    var srcD=Object.getOwnPropertyDescriptor(MP,"src");
-    Object.defineProperty(MP,"src",{configurable:true,enumerable:srcD.enumerable,get:srcD.get,set:function(){}});
-    if(Object.getOwnPropertyDescriptor(MP,"srcObject"))
-      Object.defineProperty(MP,"srcObject",{configurable:true,get:function(){return null},set:function(){}});
-    MP.play=function(){try{this.pause()}catch(e){}return Promise.resolve()};
-    MP.load=function(){};
-    var SP=HTMLSourceElement.prototype;
-    var ssD=Object.getOwnPropertyDescriptor(SP,"src");
-    if(ssD)Object.defineProperty(SP,"src",{configurable:true,enumerable:ssD.enumerable,get:ssD.get,set:function(){}});
-  }catch(e){}
-}
-
-// ── innerHTML等でパーサが直接作った要素のURLも、挿入後すぐにProxy化する
-var URL_ATTR_LIST=["src","href","action","poster","data"];
-function fixEl(el){
-  try{
-    if(!el||el.nodeType!==1)return;
-    var tg=el.tagName.toLowerCase();
-    for(var i=0;i<URL_ATTR_LIST.length;i++){
-      var a=URL_ATTR_LIST[i];
-      if(a==="data"&&tg!=="object")continue;
-      if(mediaSrcBlocked(tg,a))continue;
-      var v=el.getAttribute(a);
-      if(v==null||v===""||(v.charAt(0)==="/"&&v.charAt(1)==="~"))continue;
-      var t=prox(v);
-      if(t!==v)sa.call(el,a,t);
-    }
-  }catch(e){}
-}
-try{
-  var mo=new MutationObserver(function(ms){
-    for(var i=0;i<ms.length;i++){
-      var m=ms[i];
-      if(m.type==="attributes"){fixEl(m.target);continue}
-      for(var j=0;j<m.addedNodes.length;j++){
-        var n=m.addedNodes[j];
-        if(n.nodeType!==1)continue;
-        fixEl(n);
-        var all=n.querySelectorAll?n.querySelectorAll("[src],[href],[action],[poster],[data]"):[];
-        for(var k=0;k<all.length;k++)fixEl(all[k]);
-      }
-    }
-  });
-  mo.observe(document,{subtree:true,childList:true,attributes:true,attributeFilter:URL_ATTR_LIST});
-}catch(e){}
 
 // ── リンク/フォーム/履歴/window.open/Navigation API
 function fixLink(e){
@@ -816,52 +697,6 @@ try{
     navigator.serviceWorker.getRegistrations=function(){return Promise.resolve([])};
   }
 }catch(e){}
-
-// ── YouTube本体の上に nocookie の埋め込みを重ねる（本家画面はそのまま表示）
-var ncKey="",ncSrc="",ncFrame=null,ncSetSrc="";
-function ncCurrentSrc(){
-  var key=location.pathname+location.search;
-  if(key===ncKey)return ncSrc;
-  ncKey=key;
-  ncSrc="";
-  var e=embedFromWatch(realBase());
-  if(e){
-    var x=new URL(prox(e.href),location.href);
-    x.searchParams.set("autoplay","1");
-    x.searchParams.set("playsinline","1");
-    ncSrc=x.href;
-  }
-  return ncSrc;
-}
-function ncGetFrame(){
-  if(ncFrame)return ncFrame;
-  var f=document.createElement("iframe");
-  f.setAttribute("allow","autoplay; fullscreen; encrypted-media; picture-in-picture; clipboard-write; accelerometer; gyroscope");
-  f.setAttribute("allowfullscreen","");
-  f.setAttribute("referrerpolicy","strict-origin-when-cross-origin");
-  f.setAttribute("title","YouTube video player");
-  f.style.cssText="position:fixed;left:0;top:0;width:0;height:0;border:0;margin:0;padding:0;background:#000;z-index:2147483000;display:none";
-  (document.body||document.documentElement).appendChild(f);
-  ncFrame=f;
-  return f;
-}
-function ncSync(){
-  try{
-    var src=ncCurrentSrc();
-    var el=src?(document.querySelector("#movie_player")||document.querySelector("ytd-player")):null;
-    if(!src||!el){if(ncFrame)ncFrame.style.display="none";return}
-    var f=ncGetFrame();
-    if(ncSetSrc!==src){ncSetSrc=src;f.setAttribute("src",src)}
-    var r=el.getBoundingClientRect();
-    f.style.display=(r.width>0&&r.height>0)?"block":"none";
-    f.style.left=r.left+"px";
-    f.style.top=r.top+"px";
-    f.style.width=r.width+"px";
-    f.style.height=r.height+"px";
-  }catch(e){}
-}
-function ncLoop(){ncSync();requestAnimationFrame(ncLoop)}
-if(YT_PAGE&&!NC_PAGE)ncLoop();
 })();`;
 }
 
@@ -869,6 +704,7 @@ if(YT_PAGE&&!NC_PAGE)ncLoop();
 function makeSw() {
   return String.raw`"use strict";
 const P=${JSON.stringify(P)},HOSTS=${JSON.stringify(SITE_HOSTS)};
+const DIRECT=${DIRECT_RE.toString()};
 const O=self.location.origin;
 const isSite=(h)=>HOSTS.includes(String(h).toLowerCase());
 self.addEventListener("install",()=>self.skipWaiting());
@@ -876,6 +712,7 @@ self.addEventListener("activate",(e)=>e.waitUntil(self.clients.claim()));
 
 function toProxy(u){
   if(u.protocol!=="http:"&&u.protocol!=="https:")return null;
+  if(DIRECT.test(u.hostname))return null;
   if(isSite(u.hostname))return O+u.pathname+u.search;
   return O+P+u.protocol.slice(0,-1)+"/"+u.host+u.pathname+u.search;
 }
@@ -893,6 +730,7 @@ self.addEventListener("fetch",(e)=>{
   try{u=new URL(req.url)}catch(_){return}
   if(req.mode==="navigate")return;
   if(u.origin===O&&(u.pathname.startsWith("/~")))return;
+  if(u.origin!==O&&DIRECT.test(u.hostname))return; // nocookie は直接
   e.respondWith(handle(e,req,u));
 });
 async function handle(e,req,u){
@@ -900,7 +738,7 @@ async function handle(e,req,u){
     let target=null;
     if(u.origin===O){
       const c=await clientReal(e.clientId||e.resultingClientId);
-      if(c&&!isSite(c.host.replace(/:\d+$/,"")))target=O+P+c.scheme+"/"+c.host+u.pathname+u.search;
+      if(c&&!isSite(c.host.replace(/:\d+$/,""))&&!DIRECT.test(c.host))target=O+P+c.scheme+"/"+c.host+u.pathname+u.search;
     }else{
       target=toProxy(u);
     }
