@@ -13,7 +13,7 @@
 //    → 別サイト(GitHub等)のページからTARGETのリンクを踏んでも、GitHubへ飛ばなくなる
 //
 // 環境変数
-//  TARGET            中継の主対象（既定 https://scratch.mit.edu/）
+//  TARGET            中継の主対象（既定 https://lovable.dev/）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
@@ -27,7 +27,7 @@ import dns from "node:dns/promises";
 import crypto from "node:crypto";
 import { Readable, pipeline } from "node:stream";
 
-const TARGET = process.env.TARGET || "https://scratch.mit.edu/";
+const TARGET = process.env.TARGET || "https://lovable.dev/";
 const PORT = Number(process.env.PORT) || 10000;
 const ALLOW_EXTERNAL = process.env.ALLOW_EXTERNAL !== "0";
 const RETRIES = Number.isFinite(Number(process.env.RETRIES)) ? Number(process.env.RETRIES) : 2;
