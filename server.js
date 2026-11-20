@@ -7,8 +7,13 @@
 //  3) ServiceWorker: /~sw.js がページから出る全リクエストを最終的にProxyへ回収
 // 従来どおり、TARGET のサイトは「ルート直下」でそのまま中継されます（互換維持）。
 //
+// 修正点（ルート直下パスの誤転送）
+//  - ページ遷移(navigation/iframe)は Referer を一切見ず、必ず TARGET へ転送する
+//  - Referer を見るのは「サブリソース（画像・JS等）」かつ「Refererが外部サイトのProxyページ」の場合だけ
+//    → 別サイト(GitHub等)のページからTARGETのリンクを踏んでも、GitHubへ飛ばなくなる
+//
 // 環境変数
-//  TARGET            中継の主対象（既定 https://www.b-ch.com）
+//  TARGET            中継の主対象（既定 https://scratch.mit.edu/）
 //  PORT              Renderが自動で渡す
 //  ALLOW_EXTERNAL    0 にすると TARGET 以外のホストへの中継を禁止（既定は許可）
 //  RETRIES           GET/HEAD の再試行回数（既定 2）
@@ -79,20 +84,31 @@ function realFromProxyUrl(str, myOrigin) {
   }
 }
 
+// ページ遷移（ナビゲーション / iframe）かどうか
+function isNavigation(req) {
+  const dest = req.headers["sec-fetch-dest"];
+  const mode = req.headers["sec-fetch-mode"];
+  if (dest || mode) {
+    return mode === "navigate" || dest === "document" || dest === "iframe" || dest === "frame";
+  }
+  // Sec-Fetch-* が無い古いブラウザ向けの保険
+  return /text\/html/i.test(req.headers.accept || "");
+}
+
 // このリクエストが最終的に取りに行く上流URLを決める
 function resolveUpstream(req, url, myOrigin) {
+  // 1) /~p/https/host/path は明示的な外部サイト指定 → そのまま
   const p = parseProxyPath(url.pathname);
   if (p) return new URL(p.origin + p.path + url.search);
-  // /~p/ でないルート相対パス: Refererが外部サイトのProxyページならそのサイトへ、なければTARGETへ
+
+  // 2) ルート直下のパス（/projects/ 等）
+  //    ページ遷移は Referer を見ない → 必ず TARGET へ
+  //    （別サイトのページ上のリンクは、ここで TARGET に戻る）
   let origin = BASE.origin;
-  if (req.headers.referer) {
-    try {
-      const r = new URL(req.headers.referer);
-      if (r.origin === myOrigin) {
-        const real = realFromProxyUrl(req.headers.referer, myOrigin);
-        if (real) origin = real.origin;
-      }
-    } catch {}
+  if (!isNavigation(req) && req.headers.referer) {
+    // サブリソースのみ: Refererが「外部サイトのProxyページ」ならそのサイトへ
+    const real = realFromProxyUrl(req.headers.referer, myOrigin);
+    if (real && !isSiteHost(real.hostname)) origin = real.origin;
   }
   return new URL(origin + url.pathname + url.search);
 }
@@ -301,7 +317,7 @@ function responseHeaders(r, req, upstream, myOrigin) {
   const h = {};
   for (const [k, v] of r.headers) {
     if (DROP_RES.has(k) || k.startsWith("access-control-")) continue;
-    
+
     if (k === "location" || k === "x-pjax-url" || k === "turbo-location") {
       try {
         h[k] = toProxy(new URL(v, upstream).href, myOrigin);
@@ -310,7 +326,7 @@ function responseHeaders(r, req, upstream, myOrigin) {
       }
       continue;
     }
-    
+
     h[k] = v;
   }
   Object.assign(h, corsHeaders(req));
